@@ -1,241 +1,154 @@
-# Habit Tracker v1 — implementation plan
-
-## Product decisions
-
-Build a private, invite-only US beta PWA for 5–20 busy working professionals building 1–5 wellness habits.
-
-The core loop is: create habit → set reminder → receive nudge → one-tap check-in → see streak/progress.
-
-In v1:
-
-- Email one-time-code accounts, with a manual beta email allowlist.
-- Up to 7 active habits; warn at 5.
-- Daily, selected-weekday, and every-N-days schedules.
-- One required reminder time per habit.
-- Daily completion, undo-today, schedule-aware streaks.
-- Per-habit 30-day heatmap plus 7/30-day completion rates.
-- Offline cached experience plus queued check-ins/undo.
-- One mutual accountability partner, invite code/link, aggregate completion/streak sharing by default, optional per-habit sharing.
-- Account deletion, basic privacy note, error monitoring, and feedback email link.
-
-Explicitly deferred: AI coaching, chat, groups, target-count behavior, multiple daily check-ins, habit notes, email reminders, partner notifications, real-time collaboration, native apps, public launch, Android/Desktop support, data export, and advanced analytics.
-
-## Platform and architecture
-
-Use a static, web-first React PWA. Do not use the obsolete Expo/mobile instructions in the existing `AGENTS.md`.
-
-- React 19.3.1, TypeScript strict, Vite 8.3.4, `vite-plugin-pwa` 2.0.0 with a custom `injectManifest` service worker.
-- Node 22.12+ and npm.
-- Supabase for Postgres, Auth, Row Level Security, REST data access, Edge Functions, and scheduled jobs.
-- Cloudflare Pages for static hosting and Git-based deploy previews.
-- Supabase email OTP with custom Resend SMTP; Supabase’s default mail sender is unsuitable for beta delivery. [Supabase SMTP docs](https://supabase.com/docs/guides/auth/auth-smtp), [Resend pricing](https://resend.com/pricing)
-- `@supabase/supabase-js` 2.117.1 and `@supabase/ssr` 0.12.7. Use the browser cookie client so an authenticated Safari session can transfer when the user adds the site to the Home Screen.
-- `@block65/webcrypto-web-push` 2.0.0 in Edge Functions for VAPID web-push delivery.
-- `@sentry/react` 11.8.0 for scrubbed error reporting only; no analytics, session replay, or PII.
-
-Use Supabase RLS for routine owner-scoped reads/writes. Use Edge Functions or SQL RPCs for sensitive workflows: invite acceptance, partner-status projections, deletion, notification subscription handling, and reminder delivery.
-
-The iPhone target is iOS 17.2+ installed as a Home Screen web app. Safari browser tabs cannot receive web push; installed web apps can, after the user grants permission. [Apple web-push documentation](https://developer.apple.com/documentation/usernotifications/sending-web-push-notifications-in-web-apps-and-browsers?language=objc) The iOS 17.2 Home Screen flow transfers cookies but not local storage, so first launch after installation must re-fetch server data while retaining an authenticated cookie session. [WebKit Safari 17.2 notes](https://webkit.org/blog/14787/webkit-features-in-safari-17-2/)
-
-## Core user experience
-
-### Onboarding and authentication
-
-1. User enters an allowlisted email address and receives a one-time code.
-2. On first sign-in, collect required display name (2–30 characters) and auto-detected IANA timezone.
-3. User creates a first habit, chooses schedule and reminder time, then saves.
-4. Only after the first habit and reminder are confirmed, show Home Screen installation guidance and ask for notification permission.
-5. Returning users land on Home with today’s due habits and streaks.
-
-Do not expose whether an email is allowlisted. Enforce the allowlist in a Supabase Before User Created Auth Hook, not solely in the client. [Supabase hook documentation](https://supabase.com/docs/guides/auth/auth-hooks/before-user-created-hook?language=sql&queryGroups=language)
-
-### Habit management
-
-- Habit fields: name, active/archived state, default `target_count = 1`, schedule, reminder time, optional partner-share toggle.
-- Supported schedules: daily; selected weekdays; every N days anchored to an editable start date.
-- The suggested default reminder is 9:00 AM, but it must be explicitly confirmed.
-- A second habit in the same creation session inherits the most recently selected reminder time if available.
-- Editing schedule/reminder takes effect on the next local day; history is never recalculated.
-- Archive immediately removes the habit from Home, reminders, and partner visibility while preserving private history and allowing restoration.
-
-### Daily check-ins and stats
-
-- Home is optimized for 1–5 habits: one tap marks a due habit complete, with an undo option only for today.
-- A check-in records the user’s profile-timezone local scheduled date at tap time, plus a UTC action timestamp.
-- A missed eligible day resets the individual habit streak. Non-scheduled days do not extend or break it.
-- Overall shared streak advances only on eligible days where all active due habits are complete; no-due days are skipped.
-- Per-habit stats: current streak, longest streak, 30-day heatmap, rolling 7-day and 30-day completion rate.
-- Calculate stats from check-in records and historical schedule revisions; do not materialize a stats table in v1.
-
-### Reminders and web push
-
-- One reminder per incomplete, due habit at its configured local time.
-- If several habits are due at the same time, send one combined notification.
-- An individual notification opens a focused habit check-in route; a combined notification opens Home filtered to due habits.
-- Notifications never auto-complete a habit.
-- Notification permission denial/blocking leaves the reminder configured, shows Settings remediation, and falls back to the in-app due banner.
-- Expired subscriptions are removed on permanent push failure; transient failures are logged once without retry loops.
-- Scheduled reminder dispatch runs every minute through Supabase Cron and an Edge Function. [Supabase scheduled-function guidance](https://supabase.com/docs/guides/functions/schedule-functions)
-
-### Accountability partner
-
-- Each user may have exactly one active or pending 1:1 partnership.
-- Invite via a random, one-time code/link, expiring after seven days and revocable by the inviter.
-- Partner identity is display-name only; never reveal email.
-- Default view: owner’s `completed / eligible today` and overall streak.
-- Owner may opt individual active habits into named sharing; off by default.
-- Never expose unshared habit names, notes, history, heatmaps, completion rates, or archived habits.
-- Either partner can pause, resume, or disconnect. Pause/disconnect immediately hides both directions of sharing; paused periods are not revealed retroactively.
-- Partner status refreshes on app open, foreground, and pull-to-refresh. No real-time subscriptions or partner push notifications in v1.
-- Offline partner data is visibly labeled stale with its last refresh timestamp.
-- “Today” is evaluated in the habit owner’s timezone.
-
-### Offline behavior
-
-Allow offline:
-
-- Cached Home, habit details, stats, and last-known partner status.
-- Check-in and undo-today operations.
-
-Require network for:
-
-- Sign-in.
-- Habit creation/edit/archive.
-- Reminder changes.
-- Partner changes/invites/sharing.
-- Account deletion.
-
-Use IndexedDB for cached server data and a persistent outbox. Check-ins update optimistically, then sync with a unique client mutation ID. The database remains source of truth once sync succeeds.
-
-Conflict rule: latest client action timestamp wins, with a server tie-breaker. A unique `(habit_id, scheduled_local_date)` record prevents duplicate completion records. If the habit was remotely archived/deleted before a queued sync, reject the mutation, purge the stale local item, and never recreate it.
-
-## Data model and access rules
-
-Version all database objects, functions, RLS policies, extensions, and seed data as Supabase migrations.
-
-| Entity | Purpose |
-| --- | --- |
-| `profiles` | User ID, display name, IANA timezone, timestamps |
-| `beta_allowlist` | Normalized approved email, active/revoked state, admin-managed |
-| `habits` | Owner, name, active/archived state, future-ready `target_count` |
-| `habit_schedule_revisions` | Historical schedule definitions with effective local date |
-| `reminder_rules` | One effective local reminder time per habit in v1 |
-| `checkins` | One mutable current record per habit and scheduled local date |
-| `sync_receipts` | Idempotency receipt keyed by client mutation ID |
-| `push_subscriptions` | Endpoint/keys, installation metadata, active/failure state |
-| `reminder_deliveries` | De-duplicated sent/skipped/failed/dead delivery audit |
-| `partnerships` | Canonically ordered user pair and lifecycle state |
-| `partner_invites` | Salted invite-code digest, expiration, revoke/accept state |
-| `habit_partner_shares` | Explicit habit-level sharing permissions |
-
-RLS requirements:
-
-- Users can read/write only their own profile, habits, schedules, reminders, and check-ins.
-- Partners cannot query another user’s raw habits, schedules, or check-ins.
-- Partner data is returned only through a restricted server-side aggregate/projection.
-- Allowlist, delivery records, service secrets, and subscription key material are admin/service-only.
-- Enforce the active-habit cap and one-partner constraint server-side, not only in the UI.
-
-## Security, privacy, and deletion
-
-Browser-safe configuration:
-
-- Supabase URL and publishable key.
-- VAPID public key.
-- Sentry DSN.
-
-Server-only secrets:
-
-- Supabase service-role/secret key.
-- VAPID private JWK and contact email.
-- Resend credentials.
-- Sentry source-map upload token.
-
-Do not log habit names, emails, raw partner details, notification payloads, or check-in contents. Configure Sentry with replay disabled, PII disabled, request/breadcrumb redaction, and error-only reporting. Sentry events are dropped when its zero-cost quota is exhausted, so configure alerts separately. [Sentry usage documentation](https://docs.sentry.io/product/stats/)
-
-Deletion must be self-service in Settings, with destructive confirmation. It must immediately:
-
-1. Revoke sessions and remove the Auth user.
-2. Delete profile, habits, schedule history, reminders, check-ins, outbox receipts, subscriptions, partnerships, invites, and shares.
-3. Remove beta allowlist access.
-4. Mark local offline state invalid so it cannot recreate data after deletion.
-5. Make the former partner see only a neutral “Your partner has left” state.
-
-The privacy note must accurately state that live data is removed immediately but provider backup retention may temporarily retain residual data. Do not promise a precise backup-erasure period until confirmed in the actual Supabase plan. [Supabase backups documentation](https://supabase.com/docs/guides/platform/backups)
-
-## Delivery sequence
-
-### Week 1 — foundation and highest-risk validation
-
-1. Create the Vite/React PWA shell, routing, strict TypeScript, icons, manifest, custom service worker, and CI checks.
-2. Configure Cloudflare Pages production and isolated preview builds; previews must never receive beta Supabase credentials.
-3. Initialize local Supabase, migrations, RLS baseline, OTP auth, allowlist hook, Resend SMTP, and cookie-backed session flow.
-4. Build profile onboarding, create/edit/archive habit flow, schedule revisions, and active-habit cap.
-5. Test Safari sign-in → Home Screen installation → authenticated installed PWA on a real iPhone immediately.
-
-### Week 2 — habit loop, offline, and reminders
-
-1. Implement Home, one-tap check-ins, undo, streak calculations, and per-habit stats.
-2. Add IndexedDB cache/outbox, optimistic sync, mutation receipts, conflict resolution, and stale-state UI.
-3. Implement reminder rules, PWA push capability detection, subscription flow, cron/Edge reminder dispatch, grouping, and notification click routes.
-4. Test background reminder delivery on a physical iPhone; do not treat simulator behavior as proof.
-
-### Week 3 — partner safety and account controls
-
-1. Implement partnership lifecycle, invite codes, partner projection endpoint, explicit habit sharing, pause/resume/disconnect, and cache refresh behavior.
-2. Add archive-reminder suppression, account deletion, offline tombstone handling, privacy note, feedback `mailto:` link, and Sentry scrubbing.
-3. Build internal SQL operational views for active users, completion health, reminder attempts, and notification-open-to-check-in conversion without third-party analytics.
-
-### Week 4 — release hardening
-
-1. Run RLS, auth-hook, sync, reminder, schedule/timezone, deletion, and partner-privacy integration tests against local Supabase.
-2. Validate migration reset, backup export, and restore rehearsal before beta data exists.
-3. Run the full two-iPhone manual test matrix.
-4. Configure provider warning emails and spending limits.
-5. Deploy beta only after all required checks pass.
-
-## Acceptance tests
-
-Automated tests must cover:
-
-- Daily, weekday, every-N-day eligibility; schedule revisions; timezone and strict-midnight rules.
-- Streaks, aggregate streaks, rates, and heatmap calculations.
-- Idempotent offline check-ins, undo, retries, duplicate submissions, and cross-device latest-action-wins behavior.
-- RLS isolation, allowlist rejection, habit cap, partner constraints, invite expiration/revocation, and sharing boundaries.
-- Reminder suppression for completed/off-schedule habits, grouped notifications, expired subscriptions, and no duplicate delivery.
-- Deletion cascade and prevention of stale offline re-creation.
-
-Manual iPhone tests must cover:
-
-- Safari authentication and Home Screen installation handoff.
-- Permission timing, denied permission recovery, individual/combined push routes, and Focus-mode graceful fallback.
-- Offline open/check-in/undo/reconnect behavior.
-- Timezone travel and manual timezone update behavior.
-- Partner invite, share/unshare, pause/resume, disconnect, account deletion, and stale-cache labeling.
-
-Definition of done: lint, typecheck, unit and integration tests pass; migrations reset cleanly; two physical iPhones pass the manual flow; no PII reaches Sentry; reminder delivery works from an installed PWA; and beta deployment/backup/monitoring controls are configured.
-
-## Cost and operational defaults
-
-- Cloudflare Pages free tier for hosting. [Cloudflare Pages](https://www.cloudflare.com/developer-platform/products/pages/)
-- Supabase Free for private development/beta only; it can pause after inactivity. Upgrade to Supabase Pro before testers depend on daily reminders or before public launch. [Supabase pricing](https://supabase.com/pricing)
-- Resend Free within its monthly/day quota for beta OTP mail.
-- Sentry error-only project with a zero-dollar cap.
-- Target recurring cost: $0 during development/private trial where limits permit; approximately $25/month when Supabase Pro becomes necessary.
-
-## Assumptions
-
-- Beta users are adults in the United States and accept a lightweight wellness product without medical claims.
-- The app will use a `pages.dev` hostname initially; a custom domain is optional but required for a polished verified email sender.
-- No staging Supabase project is needed for the private beta; local Supabase plus production-like automated tests and isolated mock previews are sufficient.
-- The daily dispatch job and actual iPhone push delivery will be tested in the first two weeks because they are the largest technical risk.
-- Native iOS/Android apps remain out of scope for v1 and v2 unless PWA retention or push reliability proves inadequate.
-
-## Open risks
-
-- iOS Home Screen installation and notification permission are an onboarding funnel risk.
-- Web push is best-effort: device settings, Focus, network conditions, and expired subscriptions can prevent visible delivery.
-- Supabase’s before-user-created hook is beta functionality and requires real hosted OTP-flow validation.
-- Custom SMTP requires verified domain/DNS setup before inviting real testers.
-- The four-week scope is tight. If time slips, cut the heatmap before cutting check-ins, offline sync, reminders, or partner privacy.
-- Exact provider backup and Sentry retention settings must be confirmed in the selected accounts before public privacy/legal commitments.
+# Habit Tracker v1 — Expo native implementation plan
+
+## Product summary
+
+Build a private iOS-first beta for 5–20 busy working professionals building 1–5 wellness habits. The core loop remains: create habit → set a reminder → receive a nudge → one-tap check-in → see progress.
+
+The client is the existing Expo SDK 57 / React Native / Expo Router app. Clerk is the sole identity provider and Clerk `user.id` is the identity stored in app data. Supabase is the PostgreSQL and server-function backend.
+
+### V1 scope
+
+- Email code is the required first authentication method. After a preprovisioned user verifies that same email, Google and Apple can be linked as returning sign-in methods; no passwords, phone authentication, guest mode, or public sign-up UI.
+- Preprovisioned, restricted beta users only; TestFlight email delivery is separate from app authentication.
+- Up to seven active habits, warning at five; daily, selected-weekday, and every-N-day schedules; one required reminder per habit.
+- Daily completion, undo-today, schedule-aware streaks, completion rates, and a per-habit heatmap.
+- Offline cached app data and queued check-in/undo operations.
+- One mutual accountability partner, aggregate sharing by default, optional per-habit sharing.
+- Account deletion, a concise privacy note, error monitoring without PII, and feedback email.
+
+Explicitly deferred: AI coaching, chat, groups, target-count behavior, multiple daily check-ins, habit notes, email reminders, partner notifications, real-time collaboration, Android/Desktop release, data export, and advanced analytics.
+
+## Expo reconciliation
+
+| Earlier PWA decision | Expo decision | Status |
+| --- | --- | --- |
+| Install guide: Safari Add to Home Screen | Expo Go for Phase 1; later install an EAS development build or TestFlight build. | Changed |
+| Web Push / VAPID / service worker | Use `expo-notifications` with APNs via Expo Push Service. There is no service worker or VAPID in the native app. | Dropped/changed |
+| IndexedDB and Cache Storage | Use `expo-sqlite` for a cached data store and persistent outbox. Key data by Clerk `user.id`; clear it on sign-out or deletion. | Changed |
+| Browser-cookie session handoff | Clerk Expo with SecureStore token cache. | Changed |
+| Clerk invitation / Universal Links | Dropped for v1. Distribute TestFlight access separately and preprovision approved users server-side. | Dropped |
+| Static web hosting / Cloudflare Pages | No client-app hosting. Clerk, Supabase, and EAS remain managed services; an owned Clerk domain is still required for production. | Dropped/changed |
+| Native apps out of scope | iOS is the v1 client. Android is deferred. | Changed |
+| Reminder dispatch | Server computes due reminders; native client registers an Expo/APNs token and opens the appropriate Expo Router route from a notification. | Changed |
+| Account deletion | Server deletes app data and the Clerk user; local SQLite/outbox is cleared on-device. | Changed |
+
+The native tab layout in `src/app/(tabs)/_layout.tsx` remains the iOS tab implementation. There is no web target in v1, so the web-only tab fallback is removed. The remaining `app.json` web metadata is harmless but not a delivery target.
+
+## Authentication and beta access
+
+### Phase 1: sign-in experience
+
+- Use Clerk `useSignIn()` with the email-code API. The app never exposes a public email sign-up flow.
+- The screen is a safe-area-aware `KeyboardAvoidingView` plus a scrolling form, so the CTA remains reachable above the iPhone keyboard.
+- Collect email, send a six-digit code, verify it, finalize the Clerk session, then route to Home.
+- The resend countdown is 30 seconds. Wrong or expired codes clear the field and show a generic retry message.
+- Rejection is generic: it never reveals whether an email is approved or has an account.
+- The email screen includes Google and Apple controls to match the design. In Expo Go they deliberately say the provider is available in the full app build; the native modules are never loaded there.
+- In a development or release build, Clerk native Google and Apple flows run. A user must first have completed email-code verification for their preprovisioned email. Invite-only mode must reject every unapproved provider attempt with the same generic error. Apple Hide My Email is unsupported because its relay address cannot safely match an allowed email.
+- App configuration contains only `EXPO_PUBLIC_CLERK_PUBLISHABLE_KEY`. The Clerk secret key is server-only and must never appear in the app, EAS public environment, or source control.
+
+### Phase 2: restricted mode and provisioning
+
+Before implementation, manually validate that the Clerk Hobby instance supports Invite-only access and this exact path:
+
+1. In Clerk Dashboard, turn on Invite-only access and ensure email-code sign-in is enabled.
+2. Manually create an approved user with the email identification state **reserved** and unverified.
+3. In the Expo app, verify that this email receives and completes email-code sign-in.
+4. Try a different email in the app and verify it cannot create an account or complete sign-in; the app must show only its generic rejection copy.
+5. After the approved email completes email-code verification, test Google and Apple with that exact provider email. Verify the same Clerk user is used.
+6. Try an unapproved Google account, an unapproved Apple account, and Apple Hide My Email. None may create or finalize a session; each must show only the generic rejection copy.
+
+If that test fails, stop Phase 2 and choose between a Clerk paid allowlist, TestFlight-only manual Clerk users, or a different server-side admission design.
+
+The selected implementation is **Invite-only + preprovisioned users**:
+
+1. A server-only `provision-allowed-user` Supabase Edge Function normalizes and inserts the approved email into `allowed_emails`.
+2. It requires a provisioning-admin secret held only by a trusted operator or CI; the Expo app never receives or invokes it. It validates the secret before accessing Supabase service-role credentials or Clerk's backend key.
+3. It creates the Clerk user with a reserved email and private beta metadata. The email remains unverified until its first successful email-code sign-in.
+4. `clerk-webhook` verifies every Svix webhook signature with `CLERK_WEBHOOK_SIGNING_SECRET`, rejects failed/replayed signatures, and performs only idempotent synchronization. A webhook is not the synchronous authorization gate.
+
+## Data, offline, and privacy
+
+- Supabase data uses Clerk text user IDs (`user_…`), never `auth.users` UUID references. RLS compares the Clerk JWT `sub` to owner IDs.
+- SQLite holds cached Home, habit details, stats, partner snapshot, and an outbox for check-in/undo. Network is still required for sign-in, habit edits, reminder changes, partner changes, and deletion.
+- Check-ins are optimistic, use a unique client mutation ID, and resolve conflicts by latest client timestamp with a server tie-breaker. A unique `(habit_id, scheduled_local_date)` prevents duplicate completions.
+- Sign-out, a different authenticated Clerk user, and account deletion erase cached data and the outbox before another account can use the device.
+- Account deletion requires typed `DELETE` plus fresh email-code re-verification. A server workflow blocks normal access, removes app data transactionally, calls Clerk's server-side user-deletion API, and uses verified `user.deleted` webhooks for idempotent cleanup.
+- Do not log emails, habit names, raw partner data, Clerk IDs, session IDs, authorization headers, codes, URLs, or notification payloads. Error monitoring has PII and replay disabled.
+
+## Feature decisions retained from the product specification
+
+| Area | Decision | Expo status |
+| --- | --- | --- |
+| Habits | Name, archive/restore, future-ready `target_count`, schedule revisions, one reminder. | Unchanged |
+| Schedules | Daily, weekdays, and every N days anchored to an editable start date; future changes do not rewrite history. | Unchanged |
+| Check-ins | One completion per due day, undo only today, owner-timezone date plus UTC action timestamp. | Unchanged |
+| Streaks/statistics | Schedule-aware individual/aggregate streaks and rolling rates; calculate from records rather than a stats table. | Unchanged |
+| Heatmap | 30-day per-habit heatmap. | Unchanged; first scope cut if schedule slips |
+| Partner | Exactly one partner, privacy-preserving aggregate projection, optional named-habit sharing, code-based invite, no realtime. | Unchanged; invite link becomes an in-app code only |
+| Offline | Cached data, visible stale partner snapshot, persistent check-in/undo outbox. | Changed to SQLite |
+| Reminders | One due-habit reminder at local time; group simultaneous reminders; never auto-complete. | Changed to Expo/APNs |
+| Notification denial | Leave reminder configured, guide user to Settings, and retain in-app due banner. | Unchanged |
+| Deletion | Self-service server-side app-data and Clerk-user deletion. | Changed implementation, unchanged intent |
+
+## Testing matrix and build boundaries
+
+| Capability | Expo Go on iPhone | EAS iOS development build | TestFlight |
+| --- | --- | --- | --- |
+| Sign-in UI, email code, safe area, keyboard scrolling, native tabs, Home UI | Yes | Yes | Yes |
+| Google/Apple button layout and Expo Go availability message | Yes | Yes | Yes |
+| Real Clerk Google sign-in/linking | No | Required | Yes |
+| Real Clerk Apple sign-in/linking | No | Required | Yes |
+| Clerk SecureStore sessions and routine API/RLS work | Yes | Yes | Yes |
+| SQLite cache/outbox | Yes | Yes | Yes |
+| Local notifications scheduled by the app | Yes | Yes | Yes |
+| Remote push token, APNs delivery, background/notification-open routing | No | Required | Yes |
+| Final entitlement/config-plugin behavior and native deep-link validation | Not a release-quality test | Required | Yes |
+| External tester distribution | No | Ad hoc registered devices only | Yes |
+
+Remote notifications are unavailable in Expo Go; local notifications remain testable there. Use Expo Go until a native capability or app-config change needs a development build. When that point arrives, create one EAS development build, test it thoroughly, then use JavaScript fast refresh and EAS Update where appropriate rather than rebuilding for ordinary TypeScript/style edits.
+
+### Cloud-build workflow (no local Xcode)
+
+- Local development needs Node.js **22.13+** for Expo SDK 57. The current local Node 20.19.1 is below the SDK 57 minimum and must be upgraded before relying on the toolchain.
+- EAS CLI currently supports Node `^20.18.3 || >=22.0.0`; use `npx eas-cli@latest` with Node 22.13+ to satisfy both the CLI and Expo SDK.
+- Expo/EAS does not specify a minimum macOS version for cloud-build use. Your computer only needs to run Node 22.13+ and a terminal/browser. EAS compiles iOS on Expo's cloud macOS workers, so no local Xcode, Simulator, CocoaPods, or USB installation workflow is required.
+- The first cloud build requires an Expo account, `npx eas-cli@latest login`, EAS project configuration, a final unique iOS bundle identifier, and Apple Developer credentials. The iPhone is registered using the EAS device-registration link/QR code.
+- A paid Apple Developer Program membership is required for EAS iPhone development builds because they use ad hoc signing. It is also required for TestFlight, but it is the same $99/year membership—not a second fee.
+- Do not create a development build until the final iOS bundle identifier is approved. Changing it later creates a new Apple App ID, signing/APNs identity, and TestFlight app; existing installs cannot update seamlessly to it.
+
+### EAS Free plan and timing
+
+- Current Free plan: up to 15 iOS and 15 Android builds per month, low-priority queue, one macOS build concurrently, and a 45-minute build timeout.
+- Expo says small builds often start within a few minutes, but Free has no queue-time guarantee. Plan 30–90 minutes for a normal first-build attempt and allow more during busy periods; do not schedule a same-hour test around it.
+- New or renewed Apple memberships can take 24–72 hours before a newly registered ad hoc device becomes usable. This is an Apple processing delay, not a local-Xcode problem.
+
+## Delivery phases and review gates
+
+1. **Phase 1 — current:** email-code UI, safe-area/keyboard scrolling, generic error states, Google/Apple design controls with Expo Go safety guards, environment cleanup, native-only tab cleanup, Expo reconciliation plan, lint/typecheck, and Expo Go iPhone UI test. Stop for review.
+2. **Phase 2:** perform the Restricted-mode manual validation above. Only if it passes, add server-only provisioning, verified Clerk webhooks, and Clerk/Supabase schema/RLS work. Stop for review.
+3. **Phase 3:** add SQLite cache/outbox and `expo-notifications`. Before the first EAS iOS development build, confirm the final bundle identifier and Apple Developer membership. Build in EAS cloud and test remote push on the physical iPhone.
+4. **Phase 4:** account deletion, privacy/security hardening, TestFlight configuration/submission, two-device manual test matrix, and beta release review.
+
+## Timeline, cost, and assumptions
+
+- Estimated delivery remains **about five weeks**. Replacing a local Xcode upgrade with EAS does not reduce the native testing work; it replaces it with cloud-build, Apple credential, device-registration, and queue time. The earlier 5–7 calendar-day build/TestFlight allowance remains reasonable once Apple membership is active. If enrollment or the first device registration starts from zero, reserve an additional 1–3 calendar days for Apple processing and build retries.
+- Apple Developer Program: **$99/year**. It becomes necessary at the first EAS-signed physical-iPhone development build for remote push testing; TestFlight uses that same membership later.
+- EAS: Free tier for the current beta, subject to the build limits above.
+- Clerk Hobby: $0 while its limits and required authentication features remain sufficient.
+- Supabase: Free for development/private testing, then **$25/month** for Pro when reliable daily service is required.
+- Recurring operating cost once Supabase Pro is needed is about **$33.25/month** when the Apple fee is amortized, before a domain. This is about $3.25/month above the ~$30/month target.
+- If the timeline slips, cut the **heatmap first**, then the **every-N-days schedule**. Do not cut authentication security, check-in correctness, offline safety, reminder privacy, partner privacy, or deletion.
+
+Assumptions: adult US beta users; no medical claims; iOS first; network availability required for sensitive writes; owned domain configured for production Clerk; no public launch in v1; no native build is initiated without a confirmed bundle identifier.
+
+## Sources to re-check before each native phase
+
+- [Expo SDK 57 compatibility](https://docs.expo.dev/versions/v57.0.0/)
+- [Development builds with EAS](https://docs.expo.dev/develop/development-builds/introduction/)
+- [EAS internal distribution](https://docs.expo.dev/build/internal-distribution/)
+- [Expo push notification setup](https://docs.expo.dev/push-notifications/push-notifications-setup/)
+- [Expo pricing](https://expo.dev/pricing)
+- [Clerk access restrictions](https://clerk.com/docs/guides/secure/restricting-access)
+- [Clerk reserved email creation](https://clerk.com/docs/reference/backend/user/create-user)
+- [Clerk webhook verification](https://clerk.com/docs/guides/development/webhooks/overview)
