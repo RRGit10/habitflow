@@ -44,14 +44,14 @@ The native tab layout in `src/app/(tabs)/_layout.tsx` remains the iOS tab implem
 - The resend countdown is 30 seconds. Wrong or expired codes clear the field and show a generic retry message.
 - Rejection is generic: it never reveals whether an email is approved or has an account.
 - The email screen includes Google and Apple controls to match the design. In Expo Go they deliberately say the provider is available in the full app build; the native modules are never loaded there.
-- In a development or release build, Clerk native Google and Apple flows run. A user must first have completed email-code verification for their preprovisioned email. Restricted mode must reject every unapproved provider attempt with the same generic error. Apple Hide My Email is unsupported because its relay address cannot safely match an allowed email.
+- In a development or release build, Clerk native Google and Apple flows run. A user must first have completed email-code verification for their preprovisioned email. Invite-only mode must reject every unapproved provider attempt with the same generic error. Apple Hide My Email is unsupported because its relay address cannot safely match an allowed email.
 - App configuration contains only `EXPO_PUBLIC_CLERK_PUBLISHABLE_KEY`. The Clerk secret key is server-only and must never appear in the app, EAS public environment, or source control.
 
 ### Phase 2: restricted mode and provisioning
 
-Before implementation, manually validate that the Clerk Hobby instance supports Restricted access and this exact path:
+Before implementation, manually validate that the Clerk Hobby instance supports Invite-only access and this exact path:
 
-1. In Clerk Dashboard, turn on Restricted access and ensure email-code sign-in is enabled.
+1. In Clerk Dashboard, turn on Invite-only access and ensure email-code sign-in is enabled.
 2. Manually create an approved user with the email identification state **reserved** and unverified.
 3. In the Expo app, verify that this email receives and completes email-code sign-in.
 4. Try a different email in the app and verify it cannot create an account or complete sign-in; the app must show only its generic rejection copy.
@@ -60,7 +60,7 @@ Before implementation, manually validate that the Clerk Hobby instance supports 
 
 If that test fails, stop Phase 2 and choose between a Clerk paid allowlist, TestFlight-only manual Clerk users, or a different server-side admission design.
 
-The selected implementation is **Restricted + preprovisioned users**:
+The selected implementation is **Invite-only + preprovisioned users**:
 
 1. A server-only `provision-allowed-user` Supabase Edge Function normalizes and inserts the approved email into `allowed_emails`.
 2. It requires a provisioning-admin secret held only by a trusted operator or CI; the Expo app never receives or invokes it. It validates the secret before accessing Supabase service-role credentials or Clerk's backend key.

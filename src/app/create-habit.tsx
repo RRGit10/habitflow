@@ -5,6 +5,8 @@ import { useState } from "react";
 import { Pressable, ScrollView, StyleSheet, Switch, Text, TextInput, View } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 
+import { dateLabel } from "../data/mock-data";
+
 const NAVY = "#102958";
 const MUTED_BLUE = "#4F75AA";
 const BORDER = "#D8E6F2";
@@ -15,6 +17,7 @@ type RepeatOption = "daily" | "selected" | "interval";
 type SymbolName = SymbolViewProps["name"];
 
 export default function CreateHabitScreen() {
+  const startDateLabel = `Today, ${dateLabel(new Date())}`;
   const [habitName, setHabitName] = useState("");
   const [repeat, setRepeat] = useState<RepeatOption>("daily");
   const [selectedDays, setSelectedDays] = useState<Set<string>>(
@@ -72,7 +75,7 @@ export default function CreateHabitScreen() {
           <RepeatButton active={repeat === "interval"} label="Every N days" onPress={() => setRepeat("interval")} />
         </View>
 
-        <DetailRow icon="calendar" label="Start date" value="Today, Oct 16, 2026" />
+        <DetailRow icon="calendar" label="Start date" value={startDateLabel} />
         <DetailRow icon="clock" label="Reminder time" value="9:00 AM" />
         <Text style={styles.reminderHint}>You’ll get a reminder at this time.</Text>
 

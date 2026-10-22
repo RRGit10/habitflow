@@ -9,7 +9,7 @@ export function UndoToast() {
 
   return (
     <View pointerEvents="box-none" style={styles.container}>
-      <View style={styles.toast}>
+      <View accessibilityLiveRegion="assertive" accessibilityRole="alert" style={styles.toast}>
         <Text numberOfLines={1} style={styles.message}>{undo.text}</Text>
         <Pressable accessibilityRole="button" hitSlop={8} onPress={undoLastCheckIn}>
           <Text style={styles.undo}>Undo</Text>
